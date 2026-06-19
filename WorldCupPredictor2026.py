@@ -1317,11 +1317,296 @@ def _mostra_arbitri(ref_stats):
     print()
 
 
+# ─── 11. ANALISI SCOMMESSE ─────────────────────────────────────
+
+def _kelly(prob, quota):
+    """Frazione Kelly ottimale (0 se EV negativo)."""
+    edge = prob * quota - 1.0
+    if edge <= 0 or quota <= 1:
+        return 0.0
+    return edge / (quota - 1.0)
+
+
+def _stampa_distribuzione_bet(profits, zero_line):
+    """ASCII histogram della distribuzione profitti."""
+    bins = 12
+    counts, edges = np.histogram(profits, bins=bins)
+    max_c = max(counts)
+    bar_w = 22
+    print(col("\n  Distribuzione profitti:", "cyan"))
+    for c, e in zip(counts, edges):
+        bar = "█" * int(c / max_c * bar_w) if max_c else ""
+        color = "green" if e >= 0 else "red"
+        print(col(f"  {e:>+8.2f}€  {bar}", color))
+    print()
+
+
+_MERCATI_VALIDI = (
+    "1","X","2","1X","X2","12",
+    "GG","NG",
+    "O1.5","O2.5","O3.5","O4.5",
+    "U1.5","U2.5","U3.5",
+    "CO2.5","CO3.5","CO4.5",
+    "CU2.5","CU3.5","CU4.5",
+)
+
+def _p_over_pois_term(lam: float, k: float) -> float:
+    import math
+    k_int = int(k)
+    return 1.0 - sum(
+        math.exp(-lam) * (lam ** i) / math.factorial(i)
+        for i in range(k_int + 1)
+    )
+
+def _prob_per_sel(sel: str, ph: float, pd: float, pa: float,
+                  lam_gol: float, btts: float, lam_cards: float) -> float:
+    s = sel.upper().replace(" ", "")
+    if s == "1":  return ph
+    if s == "X":  return pd
+    if s == "2":  return pa
+    if s == "1X": return min(ph + pd, 1.0)
+    if s == "X2": return min(pd + pa, 1.0)
+    if s == "12": return min(ph + pa, 1.0)
+    if s == "GG": return btts
+    if s == "NG": return max(1.0 - btts, 0.0)
+    if s.startswith("O") and not s.startswith("OC"):
+        return _p_over_pois_term(lam_gol, float(s[1:]))
+    if s.startswith("U") and not s.startswith("UC"):
+        return max(1.0 - _p_over_pois_term(lam_gol, float(s[1:])), 0.0)
+    if s.startswith("CO"):
+        return _p_over_pois_term(lam_cards, float(s[2:]))
+    if s.startswith("CU"):
+        return max(1.0 - _p_over_pois_term(lam_cards, float(s[2:])), 0.0)
+    raise ValueError(f"Mercato non riconosciuto: '{sel}'")
+
+
+def analizza_scommessa(model, le, elo_ratings, team_hist, h2h_hist,
+                       wc_info, model_gh=None, model_ga=None,
+                       model_yh=None, model_ya=None,
+                       disc_hist=None, ref_stats=None,
+                       n_sim=100_000):
+    """Modalità --bet: input interattivo + EV + Monte Carlo."""
+    from itertools import combinations as _combs
+
+    print(col("\n" + "═" * 62, "cyan"))
+    print(col("  🎰  ANALISI SCOMMESSE  —  EV + Monte Carlo", "bold"))
+    print(col("═" * 62, "cyan"))
+
+    _merc_str = "1/X/2/1X/X2/12/GG/NG/O2.5/U2.5/CO3.5/CU3.5 …"
+
+    # ── input partite ───────────────────────────────────────────
+    try:
+        n_partite = int(input(col("\n  Quante partite nella scommessa? ", "cyan")).strip())
+        if not 1 <= n_partite <= 12:
+            raise ValueError
+    except ValueError:
+        print(col("  Numero non valido (1-12).", "red")); return
+
+    partite = []
+    for i in range(n_partite):
+        print(col(f"\n  ── Partita {i + 1} ──────────────────────────────────", "cyan"))
+        home = input(col("  Squadra casa:       ", "cyan")).strip()
+        away = input(col("  Squadra trasferta:  ", "cyan")).strip()
+        if not home or not away:
+            print(col("  Nomi mancanti.", "red")); return
+
+        try:
+            probs_raw, _, fh, fa, elo_h, elo_a, nota, w = predici_partita(
+                home, away, model, le, elo_ratings, team_hist,
+                neutral=True, h2h_hist=h2h_hist,
+            )
+        except Exception as e:
+            print(col(f"  Errore previsione: {e}", "red")); return
+
+        ph  = float(probs_raw[0])
+        pd_ = float(probs_raw[1])
+        pa  = float(probs_raw[2])
+
+        print(col(f"  Elo: {round(elo_h)} — {round(elo_a)}", "white"))
+        print(col(f"  Esito →  1:{ph*100:.0f}%  X:{pd_*100:.0f}%  2:{pa*100:.0f}%", "white"))
+
+        # Gol Poisson
+        lam_gol = 0.0; btts = 0.0
+        if model_gh is not None:
+            try:
+                gol = predici_gol_poisson(
+                    home, away, model_gh, model_ga,
+                    elo_ratings, team_hist, neutral=True, h2h_hist=h2h_hist,
+                )
+                lam_gol = float(gol["lam_h"]) + float(gol["lam_a"])
+                btts    = float(gol["btts"])
+                print(col(
+                    f"  Gol  →  λ={lam_gol:.2f}  "
+                    f"O2.5:{_p_over_pois_term(lam_gol,2)*100:.0f}%  "
+                    f"GG:{btts*100:.0f}%",
+                    "white",
+                ))
+            except Exception:
+                pass
+
+        # Cartellini Poisson
+        lam_cards = 0.0
+        if model_yh is not None:
+            try:
+                cards = predici_cartellini_poisson(
+                    home, away, model_yh, model_ya,
+                    elo_ratings, disc_hist or {},
+                    ref_stats=ref_stats,
+                )
+                lam_cards = float(cards["lam_tot"])
+                print(col(
+                    f"  Card →  λ={lam_cards:.2f}  "
+                    f"CO3.5:{_p_over_pois_term(lam_cards,3)*100:.0f}%  "
+                    f"CO4.5:{_p_over_pois_term(lam_cards,4)*100:.0f}%",
+                    "white",
+                ))
+            except Exception:
+                pass
+
+        if nota:
+            print(col(f"  ⚠ {nota}", "yellow"))
+
+        sel = input(col(f"  Mercato ({_merc_str}):  ", "cyan")).strip().upper().replace(" ", "")
+        try:
+            prob_sel = _prob_per_sel(sel, ph, pd_, pa, lam_gol, btts, lam_cards)
+        except ValueError as e:
+            print(col(f"  {e}  — uso '1'.", "yellow"))
+            sel = "1"; prob_sel = ph
+
+        try:
+            quota = float(input(col("  Quota bookmaker:    ", "cyan")).strip().replace(",", "."))
+            if quota <= 1.0:
+                raise ValueError
+        except ValueError:
+            print(col("  Quota non valida.", "red")); return
+
+        prob_imp  = 1.0 / quota
+        edge_pct  = (prob_sel - prob_imp) * 100
+        kelly_f   = _kelly(prob_sel, quota)
+        edge_col  = "green" if edge_pct > 0 else "red"
+
+        print(col(
+            f"  Modello {prob_sel*100:.1f}%  |  Impl. {prob_imp*100:.1f}%  |  "
+            f"Edge {edge_pct:+.1f}%  |  Kelly {kelly_f*100:.1f}%",
+            edge_col,
+        ))
+
+        partite.append({
+            "label":    f"{home} vs {away} [{sel}@{quota:.2f}]",
+            "home":     home, "away": away,
+            "selezione": sel, "quota": quota,
+            "prob":     prob_sel, "prob_imp": prob_imp,
+            "edge":     edge_pct, "kelly": kelly_f,
+        })
+
+    # ── tipo scommessa ──────────────────────────────────────────
+    M = len(partite)
+    print(col(f"\n  ── Tipo scommessa {'─'*38}", "cyan"))
+    print(col("  1) Multipla (tutte le selezioni)", "white"))
+    if M > 1:
+        print(col("  2) Sistema (N su M — tutte le combinazioni di N)", "white"))
+    tipo_s = input(col("  Scelta (1/2): ", "cyan")).strip()
+
+    tipo  = "sistema" if tipo_s == "2" and M > 1 else "multipla"
+    n_min = M
+
+    if tipo == "sistema":
+        try:
+            n_min = int(input(col(f"  Minimo vincenti su {M} (es. {M-1}): ", "cyan")).strip())
+            if not 1 <= n_min <= M:
+                raise ValueError
+        except ValueError:
+            print(col("  Valore non valido, uso 1.", "yellow")); n_min = 1
+
+    try:
+        stake = float(input(col("  Puntata per combinazione €: ", "cyan")).strip().replace(",", "."))
+    except ValueError:
+        stake = 10.0
+
+    # ── calcolo ─────────────────────────────────────────────────
+    probs_arr = np.array([p["prob"] for p in partite])
+    quote_arr = np.array([p["quota"] for p in partite])
+
+    combos     = list(_combs(range(M), n_min))
+    n_combos   = len(combos)
+    total_stake = stake * n_combos
+
+    # EV analitico
+    ev_analitico = 0.0
+    for combo in combos:
+        p_c = np.prod(probs_arr[list(combo)])
+        q_c = np.prod(quote_arr[list(combo)])
+        ev_analitico += p_c * stake * q_c
+    ev_analitico -= total_stake
+    roi_analitico = ev_analitico / total_stake * 100
+
+    # Monte Carlo
+    rng = np.random.default_rng()
+    draws = rng.random((n_sim, M))
+    wins_m = draws < probs_arr  # (n_sim, M)
+
+    payouts = np.zeros(n_sim)
+    for combo in combos:
+        idx = list(combo)
+        combo_wins = wins_m[:, idx].all(axis=1)
+        q_c = float(np.prod(quote_arr[idx]))
+        payouts += combo_wins * stake * q_c
+
+    profits = payouts - total_stake
+    ev_mc   = float(profits.mean())
+    p_prof  = float((profits > 0).mean() * 100)
+    p5, p25, p75, p95 = (float(x) for x in np.percentile(profits, [5, 25, 75, 95]))
+
+    # ── stampa risultati ─────────────────────────────────────────
+    W = 60
+    print(col(f"\n  ╔{'═'*W}╗", "cyan"))
+    label_tipo = f"Multipla {M}/{M}" if tipo == "multipla" else f"Sistema {n_min}/{M}"
+    print(col(f"  ║  {label_tipo}  —  {n_combos} comb. × {stake:.2f}€  =  {total_stake:.2f}€ totali", "bold"))
+    print(col(f"  ╠{'═'*W}╣", "cyan"))
+
+    # Riepilogo partite
+    for p in partite:
+        edge_c = "green" if p["edge"] > 0 else "red"
+        print(col(
+            f"  ║  {p['label']:<38}  "
+            f"Edge {p['edge']:+.1f}%  Kelly {p['kelly']*100:.1f}%",
+            edge_c,
+        ))
+
+    print(col(f"  ╠{'═'*W}╣", "cyan"))
+
+    # EV
+    ev_col = "green" if ev_analitico > 0 else "red"
+    print(col(f"  ║  EV analitico: {ev_analitico:>+8.2f}€   ROI: {roi_analitico:>+6.1f}%", ev_col))
+    p_prof_col = "green" if p_prof > 40 else "yellow" if p_prof > 20 else "red"
+    print(col(f"  ║  P(profitto):  {p_prof:>7.1f}%   EV Monte Carlo: {ev_mc:>+.2f}€", p_prof_col))
+    print(col(f"  ║  Perc.  5°: {p5:>+7.2f}€   25°: {p25:>+7.2f}€   75°: {p75:>+7.2f}€   95°: {p95:>+7.2f}€", "white"))
+
+    # Kelly sul sistema/multipla complessiva
+    p_win_tot = np.prod(probs_arr) if tipo == "multipla" else float((profits > 0).mean())
+    q_eff     = total_stake / stake if n_combos == 1 else (ev_analitico + total_stake) / (p_win_tot * total_stake + 1e-9)
+    kelly_sis = _kelly(p_win_tot, q_eff) if tipo == "multipla" else 0.0
+    if tipo == "multipla" and kelly_sis > 0:
+        print(col(f"  ║  Kelly sull'intera multipla: {kelly_sis*100:.1f}%", "white"))
+
+    print(col(f"  ╚{'═'*W}╝", "cyan"))
+
+    _stampa_distribuzione_bet(profits, 0)
+
+    # Consiglio
+    if ev_analitico > 0:
+        print(col("  ✓ EV positivo: il modello vede valore in questa scommessa.", "green"))
+    else:
+        print(col("  ✗ EV negativo: il bookmaker ha un vantaggio strutturale su questa scommessa.", "red"))
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Predittore Mondiali 2026")
     parser.add_argument("--predict",     action="store_true", help="Menu squadre WC per previsione")
     parser.add_argument("--live",        action="store_true", help="Quote live API")
     parser.add_argument("--standings",   action="store_true", help="Mostra classifiche gironi")
+    parser.add_argument("--bet",         action="store_true", help="Analisi scommesse: EV + Monte Carlo")
     parser.add_argument("--sport-key",   default="soccer_fifa_world_cup")
     parser.add_argument("--list-sports", action="store_true")
     args = parser.parse_args()
@@ -1363,6 +1648,19 @@ def main():
             stampa_standings(wc_info, elo_ratings)
         else:
             print(col("  Nessun dato WC 2026 disponibile nel dataset.", "yellow"))
+        return
+
+    # ── --bet ──────────────────────────────────────────────────
+    if args.bet:
+        while True:
+            analizza_scommessa(
+                model, le, elo_ratings, team_hist, h2h_hist, wc_info,
+                model_gh=model_gh, model_ga=model_ga,
+                model_yh=model_yh, model_ya=model_ya,
+                disc_hist=disc_hist, ref_stats=ref_stats,
+            )
+            if input(col("  Analizzare un'altra scommessa? (s/n): ", "cyan")).strip().lower() != "s":
+                break
         return
 
     # ── --list-sports ──────────────────────────────────────────
@@ -1515,6 +1813,7 @@ def main():
     print(col("   --predict     Menu squadre WC → previsione con quote", "white"))
     print(col("   --live        Quote live API (partite in programma)", "white"))
     print(col("   --standings   Classifiche gironi aggiornate", "white"))
+    print(col("   --bet         Analisi scommesse: EV + Monte Carlo", "white"))
     print(col("   --list-sports Lista sport disponibili nell'API\n", "white"))
 
 
