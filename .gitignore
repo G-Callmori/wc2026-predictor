@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.card_cache.csv
+.ref_club_cache.csv
+*.cache
